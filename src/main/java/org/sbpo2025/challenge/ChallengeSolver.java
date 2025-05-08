@@ -4,9 +4,11 @@ import org.apache.commons.lang3.time.StopWatch;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.Set;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.concurrent.TimeUnit;
 
 import ilog.concert.*;
@@ -26,19 +28,25 @@ public class ChallengeSolver {
     protected int waveSizeLB;
     protected int waveSizeUB;
 
-    protected int[] sum;
+    protected String outputFile;
+
+    protected int[] sum_orders;
+    protected int[] sum_aisles;
+
+    Graph g;
 
     IloCplex cplex;
 
     protected IloIntVar[] x;
     protected IloIntVar[] y;
-    
+    protected IloNumVar[] f;
+
     IloObjective obj;
-    IloLinearNumExpr restriction;
+    IloLinearNumExpr expr;
     IloConstraint constraint;
 
     public ChallengeSolver(
-        List<Map<Integer, Integer>> orders, List<Map<Integer, Integer>> aisles, int nOrders, int nItems, int nAisles, int waveSizeLB, int waveSizeUB) {
+        List<Map<Integer, Integer>> orders, List<Map<Integer, Integer>> aisles, int nOrders, int nItems, int nAisles, int waveSizeLB, int waveSizeUB, String outputFile) {
         this.orders = orders;
         this.aisles = aisles;
         this.nOrders = nOrders;
@@ -46,29 +54,33 @@ public class ChallengeSolver {
         this.nAisles = nAisles;
         this.waveSizeLB = waveSizeLB;
         this.waveSizeUB = waveSizeUB;
+        this.outputFile = outputFile;
+        this.g = new Graph(2+nOrders+nItems+nAisles, nOrders, nItems, nAisles);
+
+        this.sum_orders = new int[nOrders];
+        this.sum_aisles = new int[nAisles];
+        for (int i = 0; i < nOrders; i++) {
+            sum_orders[i] = orders.get(i).values().stream().mapToInt(Integer::intValue).sum();
+        }
+        for (int i = 0; i < nAisles; i++) {
+            sum_aisles[i] = aisles.get(i).values().stream().mapToInt(Integer::intValue).sum();
+        }
     }
 
-    protected void create_model(){
+    protected void create_default_model(){
         try{
             cplex = new IloCplex();
 
-            x = new IloIntVar[nOrders]; 
-            y = new IloIntVar[nAisles]; 
+            x = cplex.intVarArray(nOrders, 0, 1); 
+            y = cplex.intVarArray(nAisles, 0, 1); 
 
+            expr = cplex.linearNumExpr();
             for (int i = 0; i < nOrders; i++) {
-                x[i] = cplex.intVar(0, 1, "x_" + i);
-            }
-            for (int i = 0; i < nAisles; i++) {
-                y[i] = cplex.intVar(0, 1, "y_" + i);
+                expr.addTerm(sum_orders[i], x[i]);
             }
 
-            restriction = cplex.linearNumExpr();
-            for (int i = 0; i < nOrders; i++) {
-                restriction.addTerm(sum[i], x[i]);
-            }
-
-            cplex.addGe(restriction, waveSizeLB);
-            cplex.addLe(restriction, waveSizeUB);
+            cplex.addGe(expr, waveSizeLB);
+            cplex.addLe(expr, waveSizeUB);
 
             for (int i = 0; i < nItems; i++) {
                 IloLinearNumExpr itemOrdRestriction = cplex.linearNumExpr();
@@ -92,140 +104,265 @@ public class ChallengeSolver {
         }
     }
 
-    public ChallengeSolution brute(){
+    protected void build_graph(){
+        // s -> o
+        for(int i = 0; i < nOrders; i++){
+            g.addEdge(0, g.getId(1, i), sum_orders[i]);
+        }
+
+        // o -> i
+        for(int i = 0; i < nOrders; i++){
+            for (Map.Entry<Integer, Integer> entry : orders.get(i).entrySet()) {
+                Integer item = entry.getKey();
+                Integer qnt = entry.getValue();
+                g.addEdge(g.getId(1, i), g.getId(2, item), qnt);
+            }
+        }
+
+        // i -> a
+        for(int a = 0; a < nAisles; a++){
+            for (Map.Entry<Integer, Integer> entry : aisles.get(a).entrySet()) {
+                Integer item = entry.getKey();
+                Integer qnt = entry.getValue();
+                g.addEdge(g.getId(2, item), g.getId(3, a), qnt);
+            }
+        }
+
+        // a -> t
+        for(int i = 0; i < nAisles; i++){
+            g.addEdge(g.getId(3, i), 1, sum_aisles[i]);
+        }
+
+        // g.printGraph();
+    }
+
+    protected void create_flow_model(){
         try{
+            int N = g.getNumNodes();
+            int M = g.getNumEdges();
 
-            double best = 0.0;
-            Set<Integer> bestSelectedOrders = new HashSet<>();
-            Set<Integer> bestSelectedAisles = new HashSet<>();
+            cplex = new IloCplex();
 
-            create_model();
+            // (16)
+            x = cplex.intVarArray(nOrders, 0, 1); 
 
-            obj = null;
-            constraint = null;
+            // (17)
+            y = cplex.intVarArray(nAisles, 0, 1); 
 
-            for(int K = 1; K <= nAisles; K++){
-                if (obj != null) cplex.remove(obj);
-                if (constraint != null) cplex.remove(constraint);
+            // (18)
+            f = cplex.numVarArray(M, 0, Double.MAX_VALUE);
 
-                obj = cplex.addMaximize(cplex.prod(restriction, 1.0/K));
-                constraint = cplex.addEq(cplex.sum(y), K);
+            // (8)
+            expr = cplex.linearNumExpr();
+            for(Edge e: g.getEdges(0)){
+                expr.addTerm(1.0, f[e.id]);
+            }
 
-                if (cplex.solve() && cplex.getObjValue() > best) {
-                    best = cplex.getObjValue();
-                    Set<Integer> selectedOrders = new HashSet<>();
-                    Set<Integer> selectedAisles = new HashSet<>();
+            cplex.addMaximize(expr);
 
-                    for (int i = 0; i < nOrders; i++) {
-                        if (cplex.getValue(x[i]) > 0.5) {
-                            selectedOrders.add(i);
-                        }
-                    }
+            // (12)
+            cplex.addLe(expr, waveSizeUB);
 
-                    for (int i = 0; i < nAisles; i++) {
-                        if (cplex.getValue(y[i]) > 0.5) {
-                            selectedAisles.add(i);
-                        }
-                    }
+            // (9)
+            for(int i = 2; i < N; i++){
+                expr = cplex.linearNumExpr();
 
-                    bestSelectedOrders = selectedOrders;
-                    bestSelectedAisles = selectedAisles;
+                for(Edge e: g.getEdges(i))
+                    expr.addTerm(-1.0, f[e.id]);
+
+                for(Edge e: g.getEdgesT(i))
+                    expr.addTerm(1.0, f[e.id]);
+
+                cplex.addEq(expr, 0);
+            }
+
+            // (10)
+            for(int i = 0; i < N; i++){
+                for(Edge e: g.getEdges(i)){
+                    cplex.addLe(f[e.id], e.cap);
                 }
             }
 
-            return new ChallengeSolution(bestSelectedOrders, bestSelectedAisles);
+            // (11)
+            int j = 0;
+            for(Edge e: g.getEdges(0)){
+                cplex.addEq(f[e.id], cplex.prod(x[j], e.cap));
+                j++;
+            }
+
+            // (13)
+            // cplex.addEq(cplex.sum(y), K);
+
+            // (14) and (15)
+            for(int i = 0; i < nAisles; i++){
+                expr = cplex.linearNumExpr();
+
+                for(Edge e: g.getEdgesT(g.getId(3, i))){
+                    expr.addTerm(1.0, f[e.id]);
+                }
+                
+                cplex.addLe(y[i], expr);
+
+                int t_a = g.getEdges(g.getId(3, i)).get(0).id;
+                cplex.addGe(y[i], cplex.prod(expr, 1.0/t_a));
+            }
+        } catch (IloException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void print_sol(){
+        try{
+            System.out.println("X: ");
+
+            for (int i = 0; i < nOrders; i++) {
+                System.out.print(cplex.getValue(x[i]) + " ");
+            }
+
+            System.out.println();
+            System.out.println("Y: ");
+
+            for (int i = 0; i < nAisles; i++) {
+                System.out.print(cplex.getValue(y[i]) + " ");
+            }
+
+            System.out.println();
+            System.out.println("F: ");
+
+            for (int i = 0; i < g.getNumEdges(); i++) {
+                System.out.print(cplex.getValue(f[i]) + " ");
+            }
+
+            System.out.println();
+        } catch (IloException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public ChallengeSolution get_solution(){
+        Set<Integer> selectedOrders = new HashSet<>();
+        Set<Integer> selectedAisles = new HashSet<>();
+
+        try{
+            for (int i = 0; i < nOrders; i++) {
+                if (cplex.getValue(x[i]) > 0.0) {
+                    selectedOrders.add(i);
+                }
+            }
+
+            for (int i = 0; i < nAisles; i++) {
+                if (cplex.getValue(y[i]) > 0.0) {
+                    selectedAisles.add(i);
+                }
+            }
+        } catch (IloException e) {
+            e.printStackTrace();
+        }
+
+        return new ChallengeSolution(selectedOrders, selectedAisles);
+    }
+
+    public ChallengeSolution solve(StopWatch stopWatch) {
+        try{
+            double best = 0.0;
+
+            constraint = null;
+
+            build_graph();
+
+            create_flow_model();
+
+            ChallengeSolution solution = null;
+
+            int l = 1, r = 2;
+            while(true){
+                if (constraint != null) cplex.remove(constraint);
+                constraint = cplex.addEq(cplex.sum(y), r);
+
+                try {
+                    if (!cplex.solve() || cplex.getObjValue() >= waveSizeLB) {
+                        break;
+                    }
+                    
+                    l = r;
+                    r *= 2;
+                } catch(IloException e) {
+                    break;
+                }
+            }
+
+            // System.out.println("L: " + l);
+            // System.out.println("R: " + r);
+
+            int minimum_aisles = r;
+
+            while(l <= r){
+                int K = l+(r-l)/2;
+
+                cplex.remove(constraint);
+                constraint = cplex.addEq(cplex.sum(y), K);
+
+                try {
+                    if (!cplex.solve()) {
+                        r = K-1;
+                        continue;
+                    }
+                    
+                    if(cplex.getObjValue() >= waveSizeLB) {
+                       // print_sol();
+                       // System.out.println("OBJ_VALUE: " + cplex.getObjValue());
+
+                        minimum_aisles = K;
+                        best = cplex.getObjValue()/K;
+                        // System.out.println(K + ": " + best);
+                        solution = get_solution();
+                        r = K-1;
+                    } else {
+                        l = K+1;
+                    }
+                } catch(IloException e) {
+                    r = K-1;
+                    continue;
+                }
+            }
+
+            // System.out.println("MINIMUM: " + minimum_aisles);
+
+            Challenge challenge = new Challenge();
+
+            challenge.writeOutput(solution, outputFile);
+
+            for(int K = minimum_aisles+1; K <= nAisles; K++){
+                cplex.remove(constraint);
+                constraint = cplex.addEq(cplex.sum(y), K);
+
+                try{
+                    if(!cplex.solve())
+                        break;
+                } catch(IloException e){
+                    break;
+                }
+
+                if (cplex.getObjValue()/K > best) {
+                   // System.out.println();
+                   // System.out.println("(K, obj, mean) = (" + K + ", " + cplex.getObjValue() + ", " + cplex.getObjValue()/K + ")");
+                   // System.out.println();
+
+                    best = cplex.getObjValue()/K;
+
+                    solution = get_solution();
+                    
+                    challenge.writeOutput(solution, outputFile);
+                }
+                else break;
+            }
+
+            return solution;
         } catch (IloException e) {
             e.printStackTrace();
         }
 
         return null;
-    }
-
-    public ChallengeSolution solve(StopWatch stopWatch) {
-        Set<Integer> selectedOrders = new HashSet<>();
-        Set<Integer> selectedAisles = new HashSet<>();
-
-        sum = new int[nOrders];
-        for (int i = 0; i < nOrders; i++) {
-            sum[i] = orders.get(i).values().stream().mapToInt(Integer::intValue).sum();
-        }
-
-       // try{
-       //     create_model();
-
-       //     int l = 1, r = nAisles;
-       //     while (r-l >= 3) {
-       //         int m1 = l + (r - l) / 3;
-       //         int m2 = r - (r - l) / 3;
-
-       //         obj = cplex.addMaximize(cplex.prod(restriction, 1.0/m1));
-       //         constraint = cplex.addEq(cplex.sum(y), m1);
-
-       //         boolean b1 = cplex.solve();
-
-       //         if(!b1){
-       //             l = m1;
-       //             cplex.remove(obj);
-       //             cplex.remove(constraint);
-       //             continue;
-       //         }
-
-       //         double objc1 = cplex.getObjValue();
-
-       //         cplex.remove(obj);
-       //         cplex.remove(constraint);
-
-
-       //         obj = cplex.addMaximize(cplex.prod(restriction, 1.0/m2));
-       //         constraint = cplex.addEq(cplex.sum(y), m2);
-
-       //         cplex.solve();
-       //         double objc2 = cplex.getObjValue();
-
-       //         if (objc1 < objc2) l = m1;
-       //         else r = m2;
-
-       //         cplex.remove(obj);
-       //         cplex.remove(constraint);
-       //     }
-
-       //     double best = 0.0;
-       //     for(int K = l; K <= r; K++){
-       //         obj = cplex.addMaximize(cplex.prod(restriction, 1.0/K));
-       //         constraint = cplex.addEq(cplex.sum(y), K);
-
-       //         if (cplex.solve() && cplex.getObjValue() > best) {
-       //             best = cplex.getObjValue();
-
-       //             Set<Integer> tmpSelectedOrders = new HashSet<>();
-       //             Set<Integer> tmpSelectedAisles = new HashSet<>();
-
-       //             for (int i = 0; i < nOrders; i++) {
-       //                 if (cplex.getValue(x[i]) > 0.5)
-       //                     tmpSelectedOrders.add(i);
-       //             }
-
-       //             for (int i = 0; i < nAisles; i++) {
-       //                 if (cplex.getValue(y[i]) > 0.5)
-       //                     tmpSelectedAisles.add(i);
-       //             }
-
-       //             selectedOrders = tmpSelectedOrders;
-       //             selectedAisles = tmpSelectedAisles;
-       //         }
-
-       //         cplex.remove(obj);
-       //         cplex.remove(constraint);
-       //     }
-
-       //     return new ChallengeSolution(selectedOrders, selectedAisles);
-       // } catch (IloException e) {
-       //     e.printStackTrace();
-       // }
-
-       // return null;
-
-       return brute();
     }
 
     /*
@@ -297,5 +434,33 @@ public class ChallengeSolver {
 
         // Objective function: total units picked / number of visited aisles
         return (double) totalUnitsPicked / numVisitedAisles;
+    }
+
+    protected void destroy() {
+        try {
+            x = null;
+            y = null;
+            f = null;
+
+            obj = null;
+            expr = null;
+            constraint = null;
+
+            if (cplex != null) {
+                cplex.end();
+                cplex = null;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    protected void finalize() throws Throwable {
+        try {
+            destroy();
+        } finally {
+            super.finalize();
+        }
     }
 }
