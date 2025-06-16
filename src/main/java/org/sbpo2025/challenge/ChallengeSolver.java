@@ -67,43 +67,6 @@ public class ChallengeSolver {
         }
     }
 
-    protected void create_default_model(){
-        try{
-            cplex = new IloCplex();
-
-            x = cplex.intVarArray(nOrders, 0, 1); 
-            y = cplex.intVarArray(nAisles, 0, 1); 
-
-            expr = cplex.linearNumExpr();
-            for (int i = 0; i < nOrders; i++) {
-                expr.addTerm(sum_orders[i], x[i]);
-            }
-
-            cplex.addGe(expr, waveSizeLB);
-            cplex.addLe(expr, waveSizeUB);
-
-            for (int i = 0; i < nItems; i++) {
-                IloLinearNumExpr itemOrdRestriction = cplex.linearNumExpr();
-                for (int j = 0; j < nOrders; j++) {
-                    if (orders.get(j).containsKey(i)) {
-                        itemOrdRestriction.addTerm(x[j], orders.get(j).get(i));
-                    }
-                }
-
-                IloLinearNumExpr itemAisleRestriction = cplex.linearNumExpr();
-                for (int j = 0; j < nAisles; j++) {
-                    if (aisles.get(j).containsKey(i)) {
-                        itemAisleRestriction.addTerm(y[j], aisles.get(j).get(i));
-                    }
-                }
-
-                cplex.addLe(itemOrdRestriction, itemAisleRestriction);
-            }
-        } catch (IloException e) {
-            e.printStackTrace();
-        }
-    }
-
     protected void build_graph(){
         // s -> o
         for(int i = 0; i < nOrders; i++){
@@ -152,13 +115,12 @@ public class ChallengeSolver {
             // (18)
             f = cplex.numVarArray(M, 0, Double.MAX_VALUE);
 
-            // (8)
             expr = cplex.linearNumExpr();
-            for(Edge e: g.getEdges(0)){
+            for(Edge e: g.getEdges(0))
                 expr.addTerm(1.0, f[e.id]);
-            }
 
-            cplex.addMaximize(expr);
+            // ()
+            cplex.addGe(expr, waveSizeLB);
 
             // (12)
             cplex.addLe(expr, waveSizeUB);
@@ -189,9 +151,6 @@ public class ChallengeSolver {
                 cplex.addEq(f[e.id], cplex.prod(x[j], e.cap));
                 j++;
             }
-
-            // (13)
-            // cplex.addEq(cplex.sum(y), K);
 
             // (14) and (15)
             for(int i = 0; i < nAisles; i++){
@@ -262,9 +221,23 @@ public class ChallengeSolver {
         return new ChallengeSolution(selectedOrders, selectedAisles);
     }
 
+	protected boolean setTimeLimit(StopWatch stopWatch){
+		long cplexTimeLimit = getRemainingTime(stopWatch)-15;
+		if(cplexTimeLimit < 0) return false;
+		try{
+			cplex.setParam(IloCplex.Param.TimeLimit, cplexTimeLimit);
+		} catch(IloException e){
+			e.printStackTrace();
+		}
+
+		return true;
+	}
+
     public ChallengeSolution solve(StopWatch stopWatch) {
         try{
-            double best = 0.0;
+            if (!stopWatch.isStarted()) {
+                stopWatch.start();
+            }
 
             constraint = null;
 
@@ -272,68 +245,38 @@ public class ChallengeSolver {
 
             create_flow_model();
 
-            ChallengeSolution solution = null;
-
-            int l = 1, r = 2;
-            while(true){
-                if (constraint != null) cplex.remove(constraint);
-                constraint = cplex.addEq(cplex.sum(y), r);
-
-                try {
-                    if (!cplex.solve() || cplex.getObjValue() >= waveSizeLB) {
-                        break;
-                    }
-                    
-                    l = r;
-                    r *= 2;
-                } catch(IloException e) {
-                    break;
-                }
-            }
-
-            // System.out.println("L: " + l);
-            // System.out.println("R: " + r);
-
-            int minimum_aisles = r;
-
-            while(l <= r){
-                int K = l+(r-l)/2;
-
-                cplex.remove(constraint);
-                constraint = cplex.addEq(cplex.sum(y), K);
-
-                try {
-                    if (!cplex.solve()) {
-                        r = K-1;
-                        continue;
-                    }
-                    
-                    if(cplex.getObjValue() >= waveSizeLB) {
-                       // print_sol();
-                       // System.out.println("OBJ_VALUE: " + cplex.getObjValue());
-
-                        minimum_aisles = K;
-                        best = cplex.getObjValue()/K;
-                        // System.out.println(K + ": " + best);
-                        solution = get_solution();
-                        r = K-1;
-                    } else {
-                        l = K+1;
-                    }
-                } catch(IloException e) {
-                    r = K-1;
-                    continue;
-                }
-            }
-
-            // System.out.println("MINIMUM: " + minimum_aisles);
+            obj = cplex.addMinimize(cplex.sum(y));
 
             Challenge challenge = new Challenge();
 
-            challenge.writeOutput(solution, outputFile);
+            ChallengeSolution solution = null;
 
-            for(int K = minimum_aisles+1; K <= nAisles; K++){
-                cplex.remove(constraint);
+            int minimum_aisles = nAisles;
+			try{
+				setTimeLimit(stopWatch);
+				if(cplex.solve()){
+                    minimum_aisles = (int)cplex.getObjValue();
+                    solution = get_solution();
+                    challenge.writeOutput(solution, outputFile);
+                }
+			} catch (IloException e) {}
+
+			cplex.remove(obj);
+
+            // (8)
+            expr = cplex.linearNumExpr();
+            for(Edge e: g.getEdges(0)){
+                expr.addTerm(1.0, f[e.id]);
+            }
+
+            obj = cplex.addMaximize(expr);
+
+            double best = 0;
+            for(int K = minimum_aisles; K <= nAisles; K++){
+				if(!setTimeLimit(stopWatch))
+					break;
+
+                if(constraint != null) cplex.remove(constraint);
                 constraint = cplex.addEq(cplex.sum(y), K);
 
                 try{
@@ -344,17 +287,10 @@ public class ChallengeSolver {
                 }
 
                 if (cplex.getObjValue()/K > best) {
-                   // System.out.println();
-                   // System.out.println("(K, obj, mean) = (" + K + ", " + cplex.getObjValue() + ", " + cplex.getObjValue()/K + ")");
-                   // System.out.println();
-
                     best = cplex.getObjValue()/K;
-
                     solution = get_solution();
-                    
                     challenge.writeOutput(solution, outputFile);
                 }
-                else break;
             }
 
             return solution;
